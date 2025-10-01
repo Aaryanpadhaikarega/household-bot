@@ -1,39 +1,48 @@
 #!/usr/bin/env python3
 """
-Full household_bot.py — webhook-ready, includes admin commands and approval system.
-Replace your current file with this one.
+household_bot.py
+
+Features:
+- Webhook (Flask) for Render.
+- Admin commands: /add /del /list /importcsv
+- Approval system with expiry days: /approve <telegram_id> [days] (default 30 days)
+  and /unapprove, /approved
+- Auto-sync DB <-> CSV: accounts.csv and approved.csv (so data persists across redeploys)
+- Fetches only household links from OTT emails (Netflix patterns by default)
+- Use .env for BOT_TOKEN, ADMIN_ID, DB_FILE, CSV filenames, MAX_EMAILS_CHECK
 """
 
 import os
 import re
 import csv
-import ssl
+import sqlite3
 import imaplib
 import poplib
 import email
-import sqlite3
 from email.message import Message
 from email.utils import parseaddr
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 import telebot
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from flask import Flask, request
 
-# ====== CONFIG ======
+# ====== CONFIG (env) ======
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 DB_FILE = os.getenv("DB_FILE", "accounts.db")
-CSV_BOOTSTRAP = os.getenv("CSV_BOOTSTRAP", "accounts.csv")
+ACCOUNTS_CSV = os.getenv("ACCOUNTS_CSV", "accounts.csv")
+APPROVED_CSV = os.getenv("APPROVED_CSV", "approved.csv")
 MAX_EMAILS_CHECK = int(os.getenv("MAX_EMAILS_CHECK", "20"))
 
 if not BOT_TOKEN:
     raise SystemExit("Please set BOT_TOKEN in .env")
 if not ADMIN_ID:
-    raise SystemExit("Please set ADMIN_ID in .env (your numeric Telegram ID)")
+    raise SystemExit("Please set ADMIN_ID in .env")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
@@ -53,11 +62,11 @@ NETFLIX_LINK_PATTERNS = [
 class Account:
     email: str
     password: str
-    protocol: str  # "imap" or "pop3"
+    protocol: str  # imap / pop3
     server: str
     port: int
 
-# ====== DATABASE HELPERS ======
+# ====== DB helpers ======
 def init_db():
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
@@ -72,13 +81,91 @@ def init_db():
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS approved_users (
-            user_id INTEGER PRIMARY KEY
+            user_id INTEGER PRIMARY KEY,
+            expiry_date TEXT   -- ISO date string yyyy-mm-dd
         )
     """)
     con.commit()
     con.close()
 
-def upsert_account(acc: Account):
+# ====== CSV <-> DB sync helpers ======
+def export_accounts_to_csv():
+    con = sqlite3.connect(DB_FILE)
+    cur = con.cursor()
+    cur.execute("SELECT email,password,protocol,server,port FROM accounts ORDER BY email")
+    rows = cur.fetchall()
+    con.close()
+    if rows:
+        with open(ACCOUNTS_CSV, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["email","password","protocol","server","port"])
+            writer.writerows(rows)
+    else:
+        # write header if empty
+        with open(ACCOUNTS_CSV, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["email","password","protocol","server","port"])
+
+def export_approved_to_csv():
+    con = sqlite3.connect(DB_FILE)
+    cur = con.cursor()
+    cur.execute("SELECT user_id, expiry_date FROM approved_users ORDER BY user_id")
+    rows = cur.fetchall()
+    con.close()
+    with open(APPROVED_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["user_id","expiry_date"])
+        writer.writerows(rows)
+
+def import_accounts_from_csv():
+    if not os.path.exists(ACCOUNTS_CSV):
+        return 0
+    added = 0
+    with open(ACCOUNTS_CSV, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            email_addr = (row.get("email") or "").strip()
+            if not email_addr:
+                continue
+            password = (row.get("password") or "").strip()
+            protocol = (row.get("protocol") or "pop3").strip().lower() or "pop3"
+            server = (row.get("server") or "").strip()
+            try:
+                port = int(row.get("port") or 0)
+            except:
+                port = 0
+            if email_addr and password and server and port:
+                upsert_account_db(Account(email_addr, password, protocol, server, port))
+                added += 1
+    return added
+
+def import_approved_from_csv():
+    if not os.path.exists(APPROVED_CSV):
+        return 0
+    added = 0
+    with open(APPROVED_CSV, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            uid_s = (row.get("user_id") or "").strip()
+            expiry = (row.get("expiry_date") or "").strip()
+            if not uid_s:
+                continue
+            try:
+                uid = int(uid_s)
+            except:
+                continue
+            if expiry:
+                # validate date
+                try:
+                    datetime.strptime(expiry, "%Y-%m-%d")
+                except:
+                    expiry = ""
+            upsert_approved_db(uid, expiry or None)
+            added += 1
+    return added
+
+# ====== DB CRUD wrappers ======
+def upsert_account_db(acc: Account):
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
     cur.execute("""INSERT INTO accounts(email,password,protocol,server,port)
@@ -91,15 +178,17 @@ def upsert_account(acc: Account):
                 """, (acc.email, acc.password, acc.protocol, acc.server, acc.port))
     con.commit()
     con.close()
+    export_accounts_to_csv()
 
-def delete_account(email_addr: str):
+def delete_account_db(email_addr: str):
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
     cur.execute("DELETE FROM accounts WHERE email=?", (email_addr,))
     con.commit()
     con.close()
+    export_accounts_to_csv()
 
-def get_account(email_addr: str) -> Optional[Account]:
+def get_account_db(email_addr: str) -> Optional[Account]:
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
     cur.execute("SELECT email,password,protocol,server,port FROM accounts WHERE email=?", (email_addr,))
@@ -109,7 +198,7 @@ def get_account(email_addr: str) -> Optional[Account]:
         return Account(row[0], row[1], row[2], row[3], int(row[4]))
     return None
 
-def list_accounts() -> List[Tuple[str,str,int]]:
+def list_accounts_db() -> List[Tuple[str,str,int]]:
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
     cur.execute("SELECT email, server, port FROM accounts ORDER BY email")
@@ -117,66 +206,65 @@ def list_accounts() -> List[Tuple[str,str,int]]:
     con.close()
     return rows
 
-def bootstrap_from_csv(path: str):
-    if not os.path.exists(path):
-        return 0
-    added = 0
-    with open(path, newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            email_addr = (row.get("email") or "").strip()
-            password = (row.get("password") or "").strip()
-            protocol = (row.get("protocol") or "pop3").strip().lower() or "pop3"
-            server = (row.get("server") or "").strip()
-            try:
-                port = int(row.get("port") or 0)
-            except:
-                port = 0
-            if email_addr and password and server and port:
-                try:
-                    upsert_account(Account(email_addr, password, protocol, server, port))
-                    added += 1
-                except Exception:
-                    pass
-    return added
+# ====== Approved users DB wrappers (expiry support) ======
+def upsert_approved_db(uid: int, expiry_iso: Optional[str]):
+    con = sqlite3.connect(DB_FILE)
+    cur = con.cursor()
+    cur.execute("""INSERT INTO approved_users(user_id, expiry_date)
+                   VALUES(?, ?)
+                   ON CONFLICT(user_id) DO UPDATE SET expiry_date=excluded.expiry_date""",
+                (uid, expiry_iso))
+    con.commit()
+    con.close()
+    export_approved_to_csv()
 
-# ====== APPROVAL HELPERS ======
+def delete_approved_db(uid: int):
+    con = sqlite3.connect(DB_FILE)
+    cur = con.cursor()
+    cur.execute("DELETE FROM approved_users WHERE user_id=?", (uid,))
+    con.commit()
+    con.close()
+    export_approved_to_csv()
+
+def get_approved_db(uid: int) -> Optional[str]:
+    con = sqlite3.connect(DB_FILE)
+    cur = con.cursor()
+    cur.execute("SELECT expiry_date FROM approved_users WHERE user_id=?", (uid,))
+    row = cur.fetchone()
+    con.close()
+    if row:
+        return row[0]  # may be None
+    return None
+
+def list_approved_db() -> List[Tuple[int, Optional[str]]]:
+    con = sqlite3.connect(DB_FILE)
+    cur = con.cursor()
+    cur.execute("SELECT user_id, expiry_date FROM approved_users ORDER BY user_id")
+    rows = cur.fetchall()
+    con.close()
+    return rows
+
+# ====== Approval check (considers expiry) ======
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
 def is_approved(user_id: int) -> bool:
     if is_admin(user_id):
         return True
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
-    cur.execute("SELECT 1 FROM approved_users WHERE user_id=?", (user_id,))
-    ok = cur.fetchone() is not None
-    con.close()
-    return ok
+    expiry = get_approved_db(user_id)
+    if not expiry:
+        return False
+    try:
+        exp_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+    except:
+        return False
+    if exp_date >= datetime.utcnow().date():
+        return True
+    # expired -> auto-remove
+    delete_approved_db(user_id)
+    return False
 
-def approve_user(user_id: int):
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
-    cur.execute("INSERT OR IGNORE INTO approved_users(user_id) VALUES(?)", (user_id,))
-    con.commit()
-    con.close()
-
-def unapprove_user(user_id: int):
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
-    cur.execute("DELETE FROM approved_users WHERE user_id=?", (user_id,))
-    con.commit()
-    con.close()
-
-def list_approved() -> List[int]:
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
-    cur.execute("SELECT user_id FROM approved_users")
-    rows = [r[0] for r in cur.fetchall()]
-    con.close()
-    return rows
-
-# ====== EMAIL PARSING ======
+# ====== Email parsing helpers ======
 def normalize_link(u: str) -> str:
     u = u.strip()
     if "<" in u:
@@ -222,7 +310,7 @@ def get_text_from_message(msg: Message) -> str:
             except Exception:
                 return ""
 
-# ====== FETCH via POP3/IMAP ======
+# ====== Fetch via POP3 / IMAP (search OTT senders and extract links) ======
 def fetch_via_pop3(server: str, port: int, email_addr: str, password: str) -> List[List[str]]:
     out: List[List[str]] = []
     try:
@@ -294,14 +382,14 @@ def fetch_household_info(acc: Account) -> List[List[str]]:
     else:
         return fetch_via_pop3(acc.server, acc.port, acc.email, acc.password)
 
-# ====== CONVERSATION STATE ======
+# ====== Conversation state ======
 user_state: Dict[int, str] = {}   # user_id -> "awaiting_yes" | "awaiting_email"
 
 def greet_text() -> str:
     return ("Hi, Household Bot this side\n"
             "Looks like you have faced an household issue on your OTT platform (Enter Yes/yes to get the link or Exit/exit to exit)")
 
-# ====== BOT HANDLERS (admin + approve + user) ======
+# ====== Bot Handlers ======
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(message):
     uid = message.from_user.id
@@ -313,11 +401,10 @@ def cmd_start(message):
     bot.reply_to(message, greet_text(), reply_markup=kb)
     user_state[uid] = "awaiting_yes"
 
-# Admin-only helpers
 def admin_only(message) -> bool:
     return message.from_user.id == ADMIN_ID
 
-# Admin account management
+# ====== Admin account management ======
 @bot.message_handler(commands=['add'])
 def cmd_add(message):
     if not admin_only(message):
@@ -330,7 +417,7 @@ def cmd_add(message):
         protocol = protocol.lower()
         if protocol not in ("imap","pop3"):
             raise ValueError("protocol must be imap or pop3")
-        upsert_account(Account(email_addr, password, protocol, server, int(port)))
+        upsert_account_db(Account(email_addr, password, protocol, server, int(port)))
         bot.reply_to(message, f"✅ Saved {email_addr} ({protocol} {server}:{port})")
     except Exception:
         bot.reply_to(message, "Usage:\n/add <email> <password> <imap|pop3> <server> <port>")
@@ -341,7 +428,7 @@ def cmd_del(message):
         return
     try:
         _, email_addr = message.text.split()
-        delete_account(email_addr)
+        delete_account_db(email_addr)
         bot.reply_to(message, f"🗑️ Deleted {email_addr}")
     except Exception:
         bot.reply_to(message, "Usage:\n/del <email>")
@@ -350,7 +437,7 @@ def cmd_del(message):
 def cmd_list(message):
     if not admin_only(message):
         return
-    rows = list_accounts()
+    rows = list_accounts_db()
     if not rows:
         bot.reply_to(message, "📭 Database is empty.")
     else:
@@ -361,21 +448,25 @@ def cmd_list(message):
 def cmd_importcsv(message):
     if not admin_only(message):
         return
-    added = bootstrap_from_csv(CSV_BOOTSTRAP)
-    bot.reply_to(message, f"📥 Imported {added} account(s) from {CSV_BOOTSTRAP}")
+    added = import_accounts_from_csv()
+    bot.reply_to(message, f"📥 Imported {added} account(s) from {ACCOUNTS_CSV}")
 
-# Approval admin commands
+# ====== Approval commands (with expiry days) ======
 @bot.message_handler(commands=['approve'])
 def cmd_approve(message):
     if not admin_only(message):
         return
     try:
-        _, uid_str = message.text.split()
-        uid = int(uid_str)
-        approve_user(uid)
-        bot.reply_to(message, f"✅ Approved user {uid}")
+        parts = message.text.split()
+        if len(parts) < 2:
+            raise ValueError
+        uid = int(parts[1])
+        days = int(parts[2]) if len(parts) >= 3 else 30  # default 30 days
+        expiry = (datetime.utcnow().date() + timedelta(days=days)).isoformat()
+        upsert_approved_db(uid, expiry)
+        bot.reply_to(message, f"✅ Approved {uid} for {days} days (expires {expiry})")
     except Exception:
-        bot.reply_to(message, "Usage: /approve <telegram_id>")
+        bot.reply_to(message, "Usage: /approve <telegram_id> [days]")
 
 @bot.message_handler(commands=['unapprove'])
 def cmd_unapprove(message):
@@ -384,7 +475,7 @@ def cmd_unapprove(message):
     try:
         _, uid_str = message.text.split()
         uid = int(uid_str)
-        unapprove_user(uid)
+        delete_approved_db(uid)
         bot.reply_to(message, f"🗑️ Unapproved user {uid}")
     except Exception:
         bot.reply_to(message, "Usage: /unapprove <telegram_id>")
@@ -393,25 +484,28 @@ def cmd_unapprove(message):
 def cmd_list_approved(message):
     if not admin_only(message):
         return
-    rows = list_approved()
+    rows = list_approved_db()
     if not rows:
         bot.reply_to(message, "No approved users yet.")
     else:
-        pretty = "\n".join([f"• {uid}" for uid in rows])
-        bot.reply_to(message, "✅ Approved users:\n" + pretty)
+        lines = []
+        for uid, expiry in rows:
+            if expiry:
+                lines.append(f"• {uid} — expires {expiry}")
+            else:
+                lines.append(f"• {uid} — no expiry")
+        bot.reply_to(message, "✅ Approved users:\n" + "\n".join(lines))
 
-# Text router for Yes/email flow
+# ====== Text router for Yes/email flow ======
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def text_router(message):
     uid = message.from_user.id
     txt = (message.text or "").strip()
 
-    # Allow admin commands even if not approved? admin is always approved by is_approved()
     if not is_approved(uid):
         bot.reply_to(message, "❌ You are not approved to use this bot.\nPlease contact the admin.")
         return
 
-    # state: awaiting_yes
     if user_state.get(uid) == "awaiting_yes":
         if txt.lower() == "yes":
             bot.reply_to(message, "Enter the mail ID", reply_markup=ReplyKeyboardRemove())
@@ -421,20 +515,21 @@ def text_router(message):
             user_state.pop(uid, None)
         return
 
-    # state: awaiting_email
     if user_state.get(uid) == "awaiting_email":
         email_addr = txt
         if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email_addr):
             bot.reply_to(message, "That doesn't look like a valid email. Please send a correct mail ID.")
             return
-        acc = get_account(email_addr)
+        acc = get_account_db(email_addr)
         if not acc:
             bot.reply_to(message, "❌ This mail ID is not in the database. Please contact admin.")
             user_state.pop(uid, None)
             return
+        # acc is tuple(email,password,protocol,server,port)
+        account = Account(acc[0], acc[1], acc[2], acc[3], int(acc[4]))
         bot.send_chat_action(message.chat.id, "typing")
         try:
-            results = fetch_household_info(acc)
+            results = fetch_household_info(account)
         except Exception as e:
             bot.reply_to(message, f"⚠️ Couldn't read mailbox: {e}")
             user_state.pop(uid, None)
@@ -452,7 +547,7 @@ def text_router(message):
         user_state.pop(uid, None)
         return
 
-    # default restart keywords
+    # fallback / restart
     if txt.lower() in ("yes","start"):
         kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
         kb.row(KeyboardButton("Yes"), KeyboardButton("Exit"))
@@ -474,22 +569,24 @@ def webhook_receive():
 
 @app.route("/")
 def webhook_set():
-    # set webhook URL to your Render app domain + token
-    render_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("RENDER_APP_URL") or os.getenv("RENDER_INTERNAL_URL")
-    # fallback to the explicit domain if not provided via env
-    if not render_url:
-        render_url = "https://household-bot.onrender.com"  # <-- ensure this matches your Render service
+    # prefer Render-provided external URL env var if present
+    render_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("RENDER_APP_URL") or "https://household-bot.onrender.com"
     webhook_url = render_url.rstrip("/") + "/" + BOT_TOKEN
-    bot.remove_webhook()
-    bot.set_webhook(url=webhook_url)
-    return "Webhook set", 200
+    try:
+        bot.remove_webhook()
+        bot.set_webhook(url=webhook_url)
+        return "Webhook set", 200
+    except Exception as e:
+        return f"Webhook error: {e}", 500
 
+# ====== MAIN ======
 if __name__ == "__main__":
     init_db()
-    # bootstrap from CSV (if present) once at startup
-    try:
-        bootstrap_from_csv(CSV_BOOTSTRAP)
-    except Exception:
-        pass
+    # import CSVs into DB (bootstrap)
+    import_accounts_from_csv()
+    import_approved_from_csv()
+    # ensure CSVs reflect DB state right after import
+    export_accounts_to_csv()
+    export_approved_to_csv()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)

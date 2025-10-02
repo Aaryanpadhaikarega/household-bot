@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Full household_bot.py — webhook-ready, includes admin commands, approval system with expiry.
+Full household_bot.py — webhook-ready, includes admin commands and approval system.
 Replace your current file with this one.
 """
 
@@ -16,7 +16,6 @@ from email.message import Message
 from email.utils import parseaddr
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
-from datetime import datetime
 
 from dotenv import load_dotenv
 import telebot
@@ -73,8 +72,7 @@ def init_db():
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS approved_users (
-            user_id INTEGER PRIMARY KEY,
-            expiry TEXT  -- YYYY-MM-DD format
+            user_id INTEGER PRIMARY KEY
         )
     """)
     con.commit()
@@ -151,26 +149,15 @@ def is_approved(user_id: int) -> bool:
         return True
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
-    cur.execute("SELECT expiry FROM approved_users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
+    cur.execute("SELECT 1 FROM approved_users WHERE user_id=?", (user_id,))
+    ok = cur.fetchone() is not None
     con.close()
-    if not row:
-        return False
-    expiry = row[0]
-    if expiry:
-        today = datetime.utcnow().date()
-        try:
-            expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
-            if today > expiry_date:
-                return False
-        except Exception:
-            pass
-    return True
+    return ok
 
-def approve_user(user_id: int, expiry: Optional[str] = None):
+def approve_user(user_id: int):
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
-    cur.execute("INSERT OR REPLACE INTO approved_users(user_id, expiry) VALUES(?,?)", (user_id, expiry))
+    cur.execute("INSERT OR IGNORE INTO approved_users(user_id) VALUES(?)", (user_id,))
     con.commit()
     con.close()
 
@@ -181,11 +168,11 @@ def unapprove_user(user_id: int):
     con.commit()
     con.close()
 
-def list_approved() -> List[Tuple[int, Optional[str]]]:
+def list_approved() -> List[int]:
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
-    cur.execute("SELECT user_id, expiry FROM approved_users")
-    rows = cur.fetchall()
+    cur.execute("SELECT user_id FROM approved_users")
+    rows = [r[0] for r in cur.fetchall()]
     con.close()
     return rows
 
@@ -383,17 +370,12 @@ def cmd_approve(message):
     if not admin_only(message):
         return
     try:
-        parts = message.text.split()
-        if len(parts) < 2:
-            raise ValueError
-        uid = int(parts[1])
-        expiry = parts[2] if len(parts) > 2 else None
-        if expiry:
-            datetime.strptime(expiry, "%Y-%m-%d")
-        approve_user(uid, expiry)
-        bot.reply_to(message, f"✅ Approved user {uid}" + (f" until {expiry}" if expiry else ""))
+        _, uid_str = message.text.split()
+        uid = int(uid_str)
+        approve_user(uid)
+        bot.reply_to(message, f"✅ Approved user {uid}")
     except Exception:
-        bot.reply_to(message, "Usage: /approve <telegram_id> [YYYY-MM-DD]")
+        bot.reply_to(message, "Usage: /approve <telegram_id>")
 
 @bot.message_handler(commands=['unapprove'])
 def cmd_unapprove(message):
@@ -415,7 +397,7 @@ def cmd_list_approved(message):
     if not rows:
         bot.reply_to(message, "No approved users yet.")
     else:
-        pretty = "\n".join([f"• {uid} — expires: {expiry or 'Never'}" for uid,expiry in rows])
+        pretty = "\n".join([f"• {uid}" for uid in rows])
         bot.reply_to(message, "✅ Approved users:\n" + pretty)
 
 # Text router for Yes/email flow
@@ -424,10 +406,12 @@ def text_router(message):
     uid = message.from_user.id
     txt = (message.text or "").strip()
 
+    # Allow admin commands even if not approved? admin is always approved by is_approved()
     if not is_approved(uid):
         bot.reply_to(message, "❌ You are not approved to use this bot.\nPlease contact the admin.")
         return
 
+    # state: awaiting_yes
     if user_state.get(uid) == "awaiting_yes":
         if txt.lower() == "yes":
             bot.reply_to(message, "Enter the mail ID", reply_markup=ReplyKeyboardRemove())
@@ -437,6 +421,7 @@ def text_router(message):
             user_state.pop(uid, None)
         return
 
+    # state: awaiting_email
     if user_state.get(uid) == "awaiting_email":
         email_addr = txt
         if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email_addr):
@@ -467,6 +452,7 @@ def text_router(message):
         user_state.pop(uid, None)
         return
 
+    # default restart keywords
     if txt.lower() in ("yes","start"):
         kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
         kb.row(KeyboardButton("Yes"), KeyboardButton("Exit"))
@@ -488,6 +474,22 @@ def webhook_receive():
 
 @app.route("/")
 def webhook_set():
+    # set webhook URL to your Render app domain + token
     render_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("RENDER_APP_URL") or os.getenv("RENDER_INTERNAL_URL")
+    # fallback to the explicit domain if not provided via env
     if not render_url:
-        render_url
+        render_url = "https://household-bot.onrender.com"  # <-- ensure this matches your Render service
+    webhook_url = render_url.rstrip("/") + "/" + BOT_TOKEN
+    bot.remove_webhook()
+    bot.set_webhook(url=webhook_url)
+    return "Webhook set", 200
+
+if __name__ == "__main__":
+    init_db()
+    # bootstrap from CSV (if present) once at startup
+    try:
+        bootstrap_from_csv(CSV_BOOTSTRAP)
+    except Exception:
+        pass
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)

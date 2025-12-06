@@ -263,16 +263,46 @@ def cmd_exportdb(message):
 @bot.message_handler(func=lambda m: True)
 def text_router(message):
     uid = message.from_user.id
-    txt = message.text.lower().strip()
+    txt = (message.text or "").strip()
 
     if not is_approved(uid):
         bot.reply_to(message, "❌ Not approved.")
         return
 
-    if txt == "exit":
-        user_state.pop(uid, None)
-        bot.reply_to(message, "Exited.")
+    # ✅ STEP 1: Waiting for YES
+    if user_state.get(uid) == "awaiting_yes":
+        if txt.lower() == "yes":
+            bot.reply_to(message, "Enter the mail ID", reply_markup=ReplyKeyboardRemove())
+            user_state[uid] = "awaiting_email"
+        else:
+            bot.reply_to(message, "Exited. Type /start again.", reply_markup=ReplyKeyboardRemove())
+            user_state.pop(uid, None)
         return
+
+    # ✅ STEP 2: Waiting for Email
+    if user_state.get(uid) == "awaiting_email":
+        email_addr = txt
+
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email_addr):
+            bot.reply_to(message, "❌ Invalid email. Try again.")
+            return
+
+        acc = get_account(email_addr)
+        if not acc:
+            bot.reply_to(message, "❌ This email is not in the database.")
+            user_state.pop(uid, None)
+            return
+
+        bot.reply_to(message, "✅ Email accepted. Processing...")
+        user_state.pop(uid, None)
+        return
+
+    # ✅ EXIT command
+    if txt.lower() == "exit":
+        bot.reply_to(message, "Exited.")
+        user_state.pop(uid, None)
+        return
+
 
 # ====== WEBHOOK ======
 @app.route("/" + BOT_TOKEN, methods=['POST'])
